@@ -1,0 +1,21 @@
+[model]
+repo = "mlx-community/Qwen3-8B-4bit"
+host = "127.0.0.1"
+port = 8080
+input_tokens = 5500
+output_tokens = 2500
+timeout_seconds = 240
+
+[network]
+timeout_seconds = 60
+retries = 3
+requests_per_second = 2
+
+[collection]
+sources = ["chembl", "pubchem", "europepmc"]
+max_attachment_mb = 50
+max_article_chunks = 0
+
+[quality]
+minimum_precision = 0.95
+minimum_audit_records = 100
