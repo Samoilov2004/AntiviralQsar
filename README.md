@@ -9,7 +9,7 @@ Requires an Apple Silicon Mac and Python 3.11. From the project folder, install 
 ./run.sh collect --virus "Vaccinia virus" --papers 10
 ```
 
-This processes database results and up to 10 new papers. Use `--papers 0` for databases only, or omit it to choose interactively.
+This processes database results and up to 10 papers: new papers first; papers matched to database records by DOI/PMID only to fill gaps. Use `--papers 0` for databases only, or omit it to choose interactively.
 
 Results go to `data/runs/<run_id>/`: `measurements.csv`, `review.csv` and `report.json`. Paper extractions still need review before use in a model.
 

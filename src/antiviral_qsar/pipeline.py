@@ -12,6 +12,7 @@ from .chemistry import validate_measurement
 from .config import Config, PROMPT_VERSION, RULES_VERSION, digest
 from .documents import jats_chunks, zip_chunks, relevant_chunk, attachment_chunks, Chunk
 from .model import LocalModel, grounded, normalized_text
+from .literature import PublicationCoverage, normalize_doi, normalize_pmid, paper_pmids
 from .network import Network
 from .progress import RunProgress
 from .schema import AssayContext, Measurement, Virus
@@ -146,7 +147,9 @@ class Pipeline:
                 relation = activity.get("relation") or activity.get("standard_relation") or "="
             m = Measurement(observation_id=digest(f"chembl:{activity['activity_id']}"), source="chembl",
                 source_record_id=str(activity["activity_id"]), source_url=f"https://www.ebi.ac.uk/chembl/explore/assay/{aid}",
-                source_snapshot=snapshot, origin_assay_id=origin, document_id=doc_id, doi=document.get("doi") or "",
+                source_snapshot=snapshot, source_assay_id=aid, origin_assay_id=origin,
+                document_id=doc_id, doi=document.get("doi") or "",
+                pmids=[p] if (p := normalize_pmid(document.get("pubmed_id"))) else [],
                 compound=molecule.get("pref_name") or compound_id, compound_id=compound_id,
                 smiles_original=(molecule.get("molecule_structures") or {}).get("canonical_smiles") or "",
                 virus=(organism if organism_is_virus else virus.name) if endpoint != "CC50" else "",
@@ -227,8 +230,9 @@ class Pipeline:
                 evidence = json.dumps({"aid":aid, "sid":sid, "tid":tid, "definition":info, "value":values[tid]}, ensure_ascii=False)
                 m = Measurement(observation_id=digest(f"pubchem:{aid}:{sid}:{tid}"), source="pubchem",
                     source_record_id=f"{aid}:{sid}:{tid}", source_url=f"https://pubchem.ncbi.nlm.nih.gov/bioassay/{aid}",
-                    source_snapshot=snapshot, origin_assay_id=origin,
+                    source_snapshot=snapshot, source_assay_id=str(aid), origin_assay_id=origin,
                     document_id=";".join("PMID:"+p for p in document_ids),
+                    pmids=sorted({p for value in document_ids if (p := normalize_pmid(value))}),
                     compound=f"CID:{compound.get('CID')}" if compound else f"SID:{sid}",
                     compound_id=f"CID:{compound.get('CID')}" if compound else f"SID:{sid}",
                     smiles_original=compound.get("SMILES") or compound.get("IsomericSMILES") or "",
@@ -305,7 +309,7 @@ class Pipeline:
                 label_names[label.casefold()].add(name.strip())
         errors = []
         try:
-            documents = self.chembl.documents_by_reference(paper.get("doi", ""), paper.get("id", ""))
+            documents = self.chembl.documents_by_reference(paper.get("doi", ""), next(iter(paper_pmids(paper)), ""))
             chembl_doc = documents[0]["document_chembl_id"] if len(documents) == 1 else ""
         except Exception as exc:
             chembl_doc = ""
@@ -374,6 +378,7 @@ class Pipeline:
                     source_url=f"https://europepmc.org/articles/{paper.get('pmcid')}", source_snapshot=snapshot,
                     origin_assay_id=f"{paper_identity(paper)}:{item.experiment_label or used_chunk.locator}",
                     document_id=paper.get("pmcid", ""), doi=paper.get("doi", ""), compound=item.compound,
+                    pmids=[normalize_pmid(p) for p in paper_pmids(paper)],
                     compound_id=compound_id, smiles_original=smiles,
                     virus=item.virus or "", virus_tax_id=virus.tax_id if item.virus and relevant_virus(item.virus, virus) else "",
                     strain=item.strain or "", cell_line=item.cell_line or "", endpoint=item.endpoint,
@@ -395,6 +400,72 @@ class Pipeline:
                     m.virus = m.virus_tax_id = ""
                 observations.append(validate_measurement(m, llm_gate=self.store.quality_passed(self.config.extractor_signature)))
         return observations, errors
+
+    def publication_coverage(self, rid):
+        jobs = [j for j in self.store.jobs(rid) if j['source'] in ('chembl', 'pubchem')
+                and j['kind'] in ('assay', 'cytotoxicity')]
+        lookups, lookup_errors = {}, {}
+        for job in self.progress.track(jobs, 'Publication links'):
+            payload = job['payload']
+            if payload.get('publication_reference_status') == 'available':
+                continue
+            doc_id = payload.get('document_chembl_id')
+            lookup_key = (job['source'], doc_id if job['source'] == 'chembl' else job['key'])
+            try:
+                if lookup_key in lookup_errors:
+                    raise lookup_errors[lookup_key]
+                if lookup_key not in lookups:
+                    refs = []
+                    if job['source'] == 'chembl':
+                        doc = self.chembl.document(doc_id) if doc_id else {}
+                        doi, pmid = normalize_doi(doc.get('doi')), normalize_pmid(doc.get('pubmed_id'))
+                        if doi or pmid:
+                            refs.append({'doi': doi, 'pmid': pmid})
+                    else:
+                        description, _ = self.pubchem.description(job['key'])
+                        for entry in description.get('xref', []):
+                            entry = entry.get('xref', entry)
+                            if pmid := normalize_pmid(entry.get('pmid')):
+                                ref = {'doi': '', 'pmid': pmid}
+                                if ref not in refs:
+                                    refs.append(ref)
+                    lookups[lookup_key] = refs
+                self.store.update_job_payload(job, {**payload, 'publication_references': lookups[lookup_key],
+                    'publication_reference_status': 'available', 'publication_reference_error': ''})
+            except Exception as exc:
+                lookup_errors[lookup_key] = exc
+                error = f'{type(exc).__name__}:{str(exc)[:180]}'
+                self.store.update_job_payload(job, {**payload, 'publication_reference_status': 'failed',
+                                                   'publication_reference_error': error})
+                self.store.event(rid, f"publication_lookup:{job['source']}:{job['key']}:{error}", 'warning')
+        run = self.store.run(rid)
+        incomplete = any(run['inventory'].get('sources', {}).get(s, {}).get('status') == 'unavailable'
+                         for s in ('chembl', 'pubchem')) or bool(run['options'].get('assay_limit'))
+        return PublicationCoverage(jobs, self.store.observations(rid), incomplete=incomplete)
+
+    def prepare_papers(self, rid, coverage):
+        papers = self.store.jobs(rid, 'paper')
+        records = defaultdict(list)
+        for row in self.store.observations(rid):
+            if row.source == 'europepmc':
+                records[row.document_id].append(row)
+        for job in papers:
+            plan = coverage.plan(job['payload'])
+            self.store.update_job_payload(job, {**job['payload'], 'collection_plan': plan})
+            if job['status'] == 'done' or records[job['payload'].get('pmcid', '')]:
+                # Reconcile cached full extractions against this run's database
+                # coverage. All raw rows, including covered ones, remain stored.
+                rows = coverage.supplement(records[job['payload'].get('pmcid', '')], plan)
+                self.store.finish_job(job, rows, status=job['status'], error=job['error'])
+            if job['status'] == 'done':
+                continue
+            if plan['mode'] == 'skip':
+                self.store.finish_job(job, status='skipped', error='database_coverage:no_detected_gaps')
+            elif job['status'] == 'skipped' and job['error'] == 'database_coverage:no_detected_gaps':
+                self.store.finish_job(job, status='pending')
+        summary = Counter(j['payload']['collection_plan']['mode'] for j in papers)
+        console.print('Paper coverage: ' + '; '.join(f'{key}={summary[key]}'
+                      for key in ('new', 'unmatched', 'supplement', 'skip')))
 
     def execute(self, rid, paper_budget):
         self.progress.log_path = self.config.root / 'logs' / f'{rid}.log'
@@ -446,12 +517,19 @@ class Pipeline:
                 self.store.finish_job(job, data, "done" if data else "skipped")
             except Exception as exc:
                 self.store.finish_job(job, status="failed", error=str(exc))
+        coverage = None
+        paper_jobs = self.store.jobs(rid, 'paper')
+        if paper_jobs and (any(j['status'] in ('done', 'partial') for j in paper_jobs) or
+                (paper_budget != '0' and (paper_budget is not None or run['options'].get('papers', '0') != '0'))):
+            coverage = self.publication_coverage(rid)
+            self.prepare_papers(rid, coverage)
         papers = [j for j in self.store.jobs(rid, "paper", unfinished=True)
                   if j["payload"].get("pmcid") and j["payload"].get("isOpenAccess") == "Y"]
-        papers.sort(key=lambda j: (-paper_priority(j['payload'], virus), j['key']))
+        papers.sort(key=lambda j: (j['payload'].get('collection_plan', {}).get('mode') == 'supplement',
+                                   -paper_priority(j['payload'], virus), j['key']))
         if paper_budget is None and 'selected_paper_keys' in run['options']:
-            keys = set(run['options']['selected_paper_keys'])
-            selected = [j for j in papers if j['key'] in keys]
+            by_key = {j['key']: j for j in papers}
+            selected = [by_key[k] for k in run['options']['selected_paper_keys'] if k in by_key]
         else:
             budget = paper_budget if paper_budget is not None else run['options'].get('papers', '0')
             selected = papers if budget == "all" else papers[:int(budget or '0')]
@@ -465,6 +543,8 @@ class Pipeline:
             self.store.start_job(job)
             try:
                 data, errors = self.paper(job["payload"], virus, rid)
+                if coverage:
+                    data = coverage.supplement(data, job['payload']['collection_plan'])
                 self.store.finish_job(job, data, status="partial" if errors else "done", error=";".join(errors))
                 self.progress.log('paper_finished', id=job['key'], records=len(data), errors=errors)
             except Exception as exc:
@@ -473,7 +553,8 @@ class Pipeline:
                 self.progress.log('paper_failed', id=job['key'], error=str(exc))
         failed = [j for j in self.store.jobs(rid) if j["status"] in ("failed", "partial", "running")]
         report = self.store.run(rid)["report"]
-        report["paper_selection"] = "Open texts ranked by virus in title, endpoint in abstract, primary research; ties by identifier"
+        report["paper_selection"] = ("DOI/PMID compared with collected database assays: unmatched papers first, "
+                                     "known papers only for detected gaps; then relevance, ties by identifier")
         report.setdefault("sessions", []).append({"finished_at":now(), "seconds":round(time.monotonic()-start, 2),
                 "code_snapshot":code_snapshot, "code_hash":self.config.code_hash,
                 "llm_calls":self.model.calls, "llm_seconds":round(self.model.seconds,2),
@@ -544,8 +625,10 @@ def export_run(config, store, rid):
     folder = config.root / "data/runs" / rid
     fields = list(Measurement.model_fields) + ["status"]
     counts = {}
-    for name, rows in [("measurements", [m for m in observations if m.status == "accepted" and not m.duplicate_of]),
-                       ("review", [m for m in observations if m.status == "review" and not m.duplicate_of]),
+    for name, rows in [("measurements", [m for m in observations if m.status == "accepted" and not m.duplicate_of
+                                        and m.literature_role != 'already_covered']),
+                       ("review", [m for m in observations if m.status == "review" and not m.duplicate_of
+                                   and m.literature_role != 'already_covered']),
                        ("all_observations", observations)]:
         temp = folder / f"{name}.csv.tmp"
         with temp.open("w", encoding="utf-8-sig", newline="") as f:
@@ -566,6 +649,16 @@ def export_run(config, store, rid):
               "unique_structures":len({m.inchikey for m in observations if m.inchikey}),
               "observed_extractor_signatures":dict(Counter(m.extractor_signature for m in observations)),
               "job_counts":dict(Counter(f"{j['source']}:{j['kind']}:{j['status']}" for j in jobs)),
+              "paper_coverage": {
+                  "scope": "References attached to database assays collected in this run; not a global absence check",
+                  "counts": dict(Counter(j['payload']['collection_plan']['mode'] for j in jobs
+                                         if j['kind'] == 'paper' and 'collection_plan' in j['payload'])),
+                  "papers": [{"key": j['key'], "status": j['status'], **j['payload']['collection_plan']}
+                             for j in jobs if j['kind'] == 'paper' and 'collection_plan' in j['payload']],
+                  "reference_errors": [{"source": j['source'], "assay": j['key'],
+                                        "error": j['payload']['publication_reference_error']}
+                                       for j in jobs if j['payload'].get('publication_reference_error')],
+                  "literature_rows": dict(Counter(m.literature_role for m in observations if m.literature_role))},
               "review_reasons":dict(Counter(r for m in observations for r in m.review_reasons)),
               "unavailable_documents":[{"id":j["key"], "reason":"no_open_fulltext"} for j in jobs
                                        if j["kind"] == "paper" and (not j["payload"].get("pmcid") or j["payload"].get("isOpenAccess") != "Y")],

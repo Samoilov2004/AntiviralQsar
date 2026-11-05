@@ -17,7 +17,13 @@ cd AntiviralQsar
 
 Setup creates a local `.venv`, installs the pinned dependencies, and downloads the pinned Qwen model. If Python is not on your PATH, set `AQ_PYTHON=/path/to/python3.11` when running setup.
 
-After discovery, the CLI shows the candidate counts and asks how many new papers to process: a number, `all`, or `0`. The budget counts candidate documents, which may contain no suitable measurements. `0` processes databases only. Database measurements are unlimited by default.
+After discovery, the CLI shows the candidate counts and asks how many papers to process: a number, `all`, or `0`. The budget counts candidate documents, which may contain no suitable measurements. `0` processes databases only. Database measurements are unlimited by default.
+
+After collecting database results, the agent compares article DOI and PMID with the references of the collected ChEMBL and PubChem assays. DOI URLs, case and PMID prefixes are normalized; an exact match on either identifier is sufficient. Articles without a match are processed first. Within each group, the existing relevance ranking is used. `--papers 10` is a total budget, not ten papers per group.
+
+Matched articles are processed only when imported records lack a structure, cell line, viral strain, duration, method or usable concentration, or when a compound lacks CC50 or an antiviral endpoint. IC50 and EC50 are not required simultaneously. An absent endpoint is a search opportunity, not a claim that the paper reports it; CC50 is still not paired with an antiviral assay automatically. An assay with no imported measurements or incomplete retrieval also leaves a gap. Articles with no detected gaps are skipped without spending the paper budget or calling Qwen.
+
+Publication matching covers this run's database assays, including their companion cytotoxicity assays. It does not prove that an unmatched article is absent everywhere in either database. Missing publication identifiers, incomplete reference lookups and multi-publication assays are reported explicitly; uncertain coverage does not cause an article to be skipped. Interrupted runs retain their saved selection and order.
 
 ```bash
 ./run.sh collect --virus "Vaccinia virus" --papers 10
@@ -76,6 +82,8 @@ One row represents one measurement. Fields include original and standardized SMI
 IC50, EC50, and CC50 remain separate. Different experiments are not averaged, and missing values are not guessed. Concentrations are normalized to `value_nm`; `p_activity` is computed only for exact values. Inequalities are preserved. Unsupported units, including mass concentrations without a verified conversion, remain under review. CC50 is not automatically paired with antiviral activity to infer a selectivity index.
 
 `source_snapshot` points to an immutable cached response; `evidence_locator` identifies a record, table row, or page. Raw documents and API responses live in `data/raw/`, state in `data/state.sqlite`, and inference traces in `data/llm/`. Identical values from different experiments are retained. Cross-source copies are merged only with a matching original assay identity, structure, value, and conditions.
+
+For matched papers, extraction adds candidate measurements or missing context without overwriting database values. `supplement_of` links proposed supplements to database observation IDs; ambiguous links and conflicting values remain under review. `literature_role=already_covered` means the extracted fields add no information to an imported record. These rows remain in `all_observations.csv` and raw snapshots but are omitted from `measurements.csv` and `review.csv`; this is a coverage decision, not proof of identical experiments. Cached full extractions are reassessed against the current database results. `report.json` includes per-paper matches, gaps, skip reasons, reference errors and supplementary-row counts under `paper_coverage`.
 
 ## Independent audit
 

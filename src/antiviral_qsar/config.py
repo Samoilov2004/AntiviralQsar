@@ -7,7 +7,7 @@ from pathlib import Path
 import tomllib
 
 PROMPT_VERSION = "2026-11-05-v1"
-RULES_VERSION = "2026-11-05-v1"
+RULES_VERSION = "2026-11-06-publication-coverage-v1"
 
 
 def root_path() -> Path:

@@ -54,9 +54,11 @@ class Measurement(BaseModel):
     source_record_id: str
     source_url: str
     source_snapshot: str = ""
+    source_assay_id: str = ""
     origin_assay_id: str = ""
     document_id: str = ""
     doi: str = ""
+    pmids: list[str] = Field(default_factory=list)
     compound: str = ""
     compound_id: str = ""
     smiles_original: str = ""
@@ -88,6 +90,8 @@ class Measurement(BaseModel):
     provenance: list[dict] = Field(default_factory=list)
     duplicate_of: str = ""
     possible_duplicate_group: str = ""
+    literature_role: str = ""
+    supplement_of: list[str] = Field(default_factory=list)
 
     @property
     def status(self):

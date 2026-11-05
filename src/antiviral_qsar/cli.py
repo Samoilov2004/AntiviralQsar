@@ -74,7 +74,7 @@ def choose_budget(store, rid, requested):
         raise typer.BadParameter("No interactive terminal. Add --papers N or --papers all; the run has been saved.")
     while True:
         try:
-            return validate_budget(typer.prompt("How many new papers should be processed? [number / all / 0]"))
+            return validate_budget(typer.prompt("How many papers should be processed? [number / all / 0]"))
         except typer.BadParameter as exc:
             console.print(str(exc), style="yellow")
 

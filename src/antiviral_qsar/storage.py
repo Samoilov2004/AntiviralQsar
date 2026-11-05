@@ -98,6 +98,13 @@ class Store:
                         (now(), job["run_id"], job["source"], job["kind"], job["key"]))
         self.db.commit()
 
+    def update_job_payload(self, job, payload):
+        self.db.execute("UPDATE jobs SET payload=?,updated=? WHERE run_id=? AND source=? AND kind=? AND key=?",
+                        (json.dumps(payload, ensure_ascii=False), now(), job["run_id"],
+                         job["source"], job["kind"], job["key"]))
+        self.db.commit()
+        job["payload"] = payload
+
     def finish_job(self, job, observations=(), status="done", error=""):
         with self.db:
             for m in observations:
@@ -128,10 +135,12 @@ class Store:
                                (source, str(key))).fetchone()[0] > 0
 
     def reuse_paper(self, rid, key, paper, signature):
-        rows = self.db.execute("SELECT j.run_id,r.report FROM jobs j JOIN runs r ON r.id=j.run_id "
+        rows = self.db.execute("SELECT j.run_id,r.report,r.virus FROM jobs j JOIN runs r ON r.id=j.run_id "
                                "WHERE j.source='europepmc' AND j.key=? AND j.status='done' "
                                "AND j.run_id<>? ORDER BY j.updated DESC", (key, rid)).fetchall()
         for row in rows:
+            if json.loads(row['virus']).get('tax_id') != self.run(rid)['virus'].get('tax_id'):
+                continue
             if json.loads(row['report']).get('model', {}).get('signature') != signature:
                 continue
             previous = [m for m in self.observations(row['run_id'])
